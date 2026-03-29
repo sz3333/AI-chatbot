@@ -64,15 +64,28 @@ try:
 except ImportError:
     GOOGLE_AVAILABLE = False
 
-# ─── Конфигурация ───────────────────────────────────────────────────────────
+# ─── Конфигурация (из config.py) ────────────────────────────────────────────
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")          # обязательно
-OWNER_ID    = 93823977                              # твой TG ID
-DB_PATH     = "gemini_bot.db"
-DEFAULT_MODEL    = "gemini-2.5-flash"
-GEMINI_TIMEOUT   = 120
-MAX_HISTORY_PAIRS = 30                             # пар user/model в памяти
-MAX_TG_LEN       = 4000                            # до этого — текст, больше — файл
+try:
+    import config as _cfg
+except ModuleNotFoundError:
+    raise SystemExit(
+        "❌ Файл config.py не найден!\n"
+        "Скопируй config.example.py → config.py и заполни его."
+    )
+
+BOT_TOKEN         = getattr(_cfg, "BOT_TOKEN", "")
+OWNER_ID          = getattr(_cfg, "OWNER_ID", 0)
+DB_PATH           = getattr(_cfg, "DB_PATH", "gemini_bot.db")
+DEFAULT_MODEL     = getattr(_cfg, "DEFAULT_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT    = getattr(_cfg, "GEMINI_TIMEOUT", 120)
+MAX_HISTORY_PAIRS = getattr(_cfg, "MAX_HISTORY_PAIRS", 30)
+MAX_TG_LEN        = getattr(_cfg, "MAX_TG_LEN", 4000)
+
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN не задан в config.py!")
+if not OWNER_ID:
+    raise SystemExit("❌ OWNER_ID не задан в config.py!")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,10 +95,10 @@ log = logging.getLogger("gemini_bot")
 
 # ─── Антиспам конфиг ─────────────────────────────────────────────────────────
 
-SPAM_WINDOW_SEC   = 10      # окно в секундах
-SPAM_MAX_MESSAGES = 5       # макс сообщений за окно до предупреждения
-SPAM_BAN_AFTER    = 10      # столько сообщений за окно — автобан
-SPAM_BAN_DURATION = 300     # бан на N секунд (5 минут по умолчанию)
+SPAM_WINDOW_SEC   = getattr(_cfg, "SPAM_WINDOW_SEC",   10)
+SPAM_MAX_MESSAGES = getattr(_cfg, "SPAM_MAX_MESSAGES",  5)
+SPAM_BAN_AFTER    = getattr(_cfg, "SPAM_BAN_AFTER",    10)
+SPAM_BAN_DURATION = getattr(_cfg, "SPAM_BAN_DURATION", 300)
 
 # ─── База данных ─────────────────────────────────────────────────────────────
 
@@ -530,12 +543,3 @@ async def cmd_setglobalprompt(msg: Message):
             "Чтобы установить: /setglobalprompt &lt;текст&gt;",
             parse_mode=ParseMode.HTML,
         )
-    prompt = args[1].strip()
-    await set_setting("global_prompt", prompt)
-    await msg.answer(f"✅ Глобальный промт установлен ({len(prompt)} символов).", parse_mode=ParseMode.HTML)
-
-# ── /statdb (владелец) ───────────────────────────────────────────────────────
-
-@router.message(Command("statdb"))
-async def cmd_statdb(msg: Message):
-    if not 
