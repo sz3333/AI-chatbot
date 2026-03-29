@@ -11,7 +11,7 @@ OWNER_ID  = 0           # твой Telegram ID (узнать: @userinfobot)
 DB_PATH = "gemini_bot.db"
 
 # ── Gemini ────────────────────────────────────────────────
-DEFAULT_MODEL     = "gemini-2.5-flash"
+DEFAULT_MODEL     = "gemini-2.5-flash-lite"
 GEMINI_TIMEOUT    = 120
 
 # ── История диалогов ──────────────────────────────────────
