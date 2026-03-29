@@ -18,8 +18,6 @@ GEMINI_TIMEOUT    = 120
 MAX_HISTORY_PAIRS = 30
 MAX_TG_LEN        = 4000
 
-# ── Антиспам ──────────────────────────────────────────────
-SPAM_WINDOW_SEC   = 10
-SPAM_MAX_MESSAGES = 5
-SPAM_BAN_AFTER    = 10
-SPAM_BAN_DURATION = 300
+# === Защита от спама ===
+ANTI_SPAM_DELAY = 4.0      # секунд между сообщениями (0.0 = отключить)
+SPAM_WARNING    = False    # True = бот будет писать "не флуди"
