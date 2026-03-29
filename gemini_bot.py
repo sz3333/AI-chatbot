@@ -22,9 +22,6 @@
   /clearall                   — очистить всю память бота
   /setmodel <модель>          — сменить модель Gemini
   /keystat                    — статистика ключей API
-  /ban <id> [сек]            — забанить юзера вручную
-  /unban <id>                — разбанить юзера
-  /banlist                   — список активных банов
 
 Команды для всех (только в ЛС):
   /setprompt <текст>          — личный промт (только для себя)
@@ -64,41 +61,21 @@ try:
 except ImportError:
     GOOGLE_AVAILABLE = False
 
-# ─── Конфигурация (из config.py) ────────────────────────────────────────────
+# ─── Конфигурация ───────────────────────────────────────────────────────────
 
-try:
-    import config as _cfg
-except ModuleNotFoundError:
-    raise SystemExit(
-        "❌ Файл config.py не найден!\n"
-        "Скопируй config.example.py → config.py и заполни его."
-    )
-
-BOT_TOKEN         = getattr(_cfg, "BOT_TOKEN", "")
-OWNER_ID          = getattr(_cfg, "OWNER_ID", 0)
-DB_PATH           = getattr(_cfg, "DB_PATH", "gemini_bot.db")
-DEFAULT_MODEL     = getattr(_cfg, "DEFAULT_MODEL", "gemini-2.5-flash")
-GEMINI_TIMEOUT    = getattr(_cfg, "GEMINI_TIMEOUT", 120)
-MAX_HISTORY_PAIRS = getattr(_cfg, "MAX_HISTORY_PAIRS", 30)
-MAX_TG_LEN        = getattr(_cfg, "MAX_TG_LEN", 4000)
-
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN не задан в config.py!")
-if not OWNER_ID:
-    raise SystemExit("❌ OWNER_ID не задан в config.py!")
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "")          # обязательно
+OWNER_ID    = 93823977                              # твой TG ID
+DB_PATH     = "gemini_bot.db"
+DEFAULT_MODEL    = "gemini-2.5-flash"
+GEMINI_TIMEOUT   = 120
+MAX_HISTORY_PAIRS = 30                             # пар user/model в памяти
+MAX_TG_LEN       = 4000                            # до этого — текст, больше — файл
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("gemini_bot")
-
-# ─── Антиспам конфиг ─────────────────────────────────────────────────────────
-
-SPAM_WINDOW_SEC   = getattr(_cfg, "SPAM_WINDOW_SEC",   10)
-SPAM_MAX_MESSAGES = getattr(_cfg, "SPAM_MAX_MESSAGES",  5)
-SPAM_BAN_AFTER    = getattr(_cfg, "SPAM_BAN_AFTER",    10)
-SPAM_BAN_DURATION = getattr(_cfg, "SPAM_BAN_DURATION", 300)
 
 # ─── База данных ─────────────────────────────────────────────────────────────
 
@@ -236,80 +213,6 @@ async def clear_all_history():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM history")
         await db.commit()
-
-# ─── Антиспам / Rate limiter ─────────────────────────────────────────────────
-
-class RateLimiter:
-    """
-    Sliding-window rate limiter + автобан.
-    Хранится в RAM (сбрасывается при рестарте бота).
-    """
-    def __init__(self):
-        # user_id -> list[timestamp]
-        self._history: dict[int, list[float]] = {}
-        # user_id -> ban_until (timestamp)
-        self._banned: dict[int, float] = {}
-        # user_id -> предупреждён уже в этом окне?
-        self._warned: dict[int, bool] = {}
-
-    def _clean(self, uid: int, now: float):
-        """Убираем старые отметки из окна."""
-        self._history.setdefault(uid, [])
-        self._history[uid] = [t for t in self._history[uid] if now - t < SPAM_WINDOW_SEC]
-
-    def check(self, uid: int) -> tuple[str, int]:
-        """
-        Возвращает (статус, ban_left_sec).
-        статус: 'ok' | 'warn' | 'ban' | 'banned'
-        """
-        now = time.time()
-
-        # Уже забанен?
-        ban_until = self._banned.get(uid, 0)
-        if ban_until > now:
-            return "banned", int(ban_until - now)
-
-        self._clean(uid, now)
-        self._history[uid].append(now)
-        count = len(self._history[uid])
-
-        if count >= SPAM_BAN_AFTER:
-            self._banned[uid] = now + SPAM_BAN_DURATION
-            self._history[uid] = []
-            self._warned[uid] = False
-            log.warning(f"[ANTISPAM] Забанен uid={uid} на {SPAM_BAN_DURATION}с")
-            return "ban", SPAM_BAN_DURATION
-
-        if count >= SPAM_MAX_MESSAGES:
-            if not self._warned.get(uid):
-                self._warned[uid] = True
-                return "warn", 0
-            return "spam", 0   # молча игнорируем
-
-        self._warned[uid] = False
-        return "ok", 0
-
-    def unban(self, uid: int):
-        self._banned.pop(uid, None)
-        self._history.pop(uid, None)
-        self._warned.pop(uid, None)
-
-    def is_banned(self, uid: int) -> tuple[bool, int]:
-        ban_until = self._banned.get(uid, 0)
-        now = time.time()
-        if ban_until > now:
-            return True, int(ban_until - now)
-        return False, 0
-
-    def ban_list(self) -> list[tuple[int, int]]:
-        now = time.time()
-        return [(uid, int(until - now)) for uid, until in self._banned.items() if until > now]
-
-    def manual_ban(self, uid: int, duration: int = SPAM_BAN_DURATION):
-        self._banned[uid] = time.time() + duration
-        self._history.pop(uid, None)
-
-rate_limiter = RateLimiter()
 
 # ─── Менеджер API-ключей ─────────────────────────────────────────────────────
 
@@ -498,10 +401,7 @@ async def cmd_help(msg: Message):
             "/broadcast &lt;текст&gt; — рассылка всем\n"
             "/clearall — очистить всю память\n"
             "/setmodel &lt;модель&gt; — сменить модель Gemini\n"
-            "/keystat — статус ключей\n"
-            "/ban &lt;id&gt; [сек] — забанить юзера\n"
-            "/unban &lt;id&gt; — разбанить\n"
-            "/banlist — список активных банов"
+            "/keystat — статус ключей"
         )
     await msg.answer(
         "<b>📚 Команды:</b>\n"
@@ -543,15 +443,299 @@ async def cmd_setglobalprompt(msg: Message):
             "Чтобы установить: /setglobalprompt &lt;текст&gt;",
             parse_mode=ParseMode.HTML,
         )
+    prompt = args[1].strip()
+    await set_setting("global_prompt", prompt)
+    await msg.answer(f"✅ Глобальный промт установлен ({len(prompt)} символов).", parse_mode=ParseMode.HTML)
+
+# ── /statdb (владелец) ───────────────────────────────────────────────────────
+
+@router.message(Command("statdb"))
+async def cmd_statdb(msg: Message):
+    if not is_owner(msg):
+        return
+    total = await count_active_users()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM history") as cur:
+            hist_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            all_users = (await cur.fetchone())[0]
+    model = await get_setting("gemini_model", DEFAULT_MODEL)
+    keys_count = len(key_manager.get_keys())
+    await msg.answer(
+        f"<b>📊 Статистика БД:</b>\n"
+        f"👥 Всего юзеров: <b>{all_users}</b>\n"
+        f"✅ Активных: <b>{total}</b>\n"
+        f"💬 Записей в истории: <b>{hist_count}</b>\n"
+        f"🔑 API ключей: <b>{keys_count}</b>\n"
+        f"🤖 Модель: <code>{model}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ── /addusers (владелец, только ЛС) ─────────────────────────────────────────
+
+_awaiting_users_file: set[int] = set()
+
+@router.message(Command("addusers"))
+async def cmd_addusers(msg: Message):
+    if not is_owner(msg):
+        return
+    if not is_pm(msg):
+        return await msg.answer("Эту команду можно использовать только в ЛС.")
+    _awaiting_users_file.add(msg.from_user.id)
+    await msg.answer(
+        "📎 Пришли .txt файл со списком пользователей.\n\n"
+        "<b>Формат файла</b> (каждый ID на новой строке, или через запятую):\n"
+        "<pre>123456789\n987654321\n111222333</pre>\n"
+        "или\n"
+        "<pre>123456789, 987654321, 111222333</pre>\n\n"
+        "Бот проверит и добавит их в БД.",
+        parse_mode=ParseMode.HTML,
+    )
+
+@router.message(F.document, F.chat.type == ChatType.PRIVATE)
+async def handle_document(msg: Message, bot: Bot):
+    if not msg.from_user:
+        return
+    uid = msg.from_user.id
+    # Обработка файла для /addusers
+    if uid in _awaiting_users_file and is_owner(msg):
+        _awaiting_users_file.discard(uid)
+        if not msg.document.file_name.endswith(".txt"):
+            return await msg.answer("❌ Нужен именно .txt файл.")
+        try:
+            file = await bot.get_file(msg.document.file_id)
+            content_bytes = await bot.download_file(file.file_path)
+            text = content_bytes.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            return await msg.answer(f"❌ Ошибка чтения файла: {e}")
+
+        # Парсим ID
+        raw_ids = re.findall(r"\d{5,15}", text)
+        user_ids = list({int(i) for i in raw_ids})
+
+        if not user_ids:
+            return await msg.answer("❌ Не найдено ни одного ID в файле.")
+
+        status_msg = await msg.answer(f"⏳ Обрабатываю {len(user_ids)} ID...")
+        added, skipped = await add_user_ids_bulk(user_ids)
+        await status_msg.edit_text(
+            f"✅ Готово!\n"
+            f"➕ Добавлено новых: <b>{added}</b>\n"
+            f"🔄 Уже были в БД (помечены активными): <b>{skipped}</b>\n"
+            f"📊 Всего обработано: <b>{len(user_ids)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Если не ждём файл — игнорируем документ в ЛС
+    # (можно добавить обработку других документов)
+
+# ── /broadcast (владелец) ────────────────────────────────────────────────────
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(msg: Message, bot: Bot):
+    if not is_owner(msg):
+        return
+    args = msg.text.split(maxsplit=1)
+    if len(args) < 2:
+        return await msg.answer("Использование: /broadcast &lt;текст сообщения&gt;", parse_mode=ParseMode.HTML)
+    text = args[1]
+    ids = await all_active_user_ids()
+    sent = failed = 0
+    status = await msg.answer(f"⏳ Рассылка {len(ids)} пользователям...")
+    for uid in ids:
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # антиспам
+    await status.edit_text(
+        f"✅ Рассылка завершена.\n"
+        f"📨 Отправлено: <b>{sent}</b>\n"
+        f"❌ Не доставлено: <b>{failed}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ── /clearall (владелец) ─────────────────────────────────────────────────────
+
+@router.message(Command("clearall"))
+async def cmd_clearall(msg: Message):
+    if not is_owner(msg):
+        return
+    await clear_all_history()
+    await msg.answer("🧹 Вся история диалогов очищена.")
+
+# ── /setmodel (владелец) ─────────────────────────────────────────────────────
+
+@router.message(Command("setmodel"))
+async def cmd_setmodel(msg: Message):
+    if not is_owner(msg):
+        return
+    args = msg.text.split(maxsplit=1)
+    if len(args) < 2:
+        cur = await get_setting("gemini_model", DEFAULT_MODEL)
+        return await msg.answer(f"Текущая модель: <code>{cur}</code>\nИспользование: /setmodel &lt;модель&gt;", parse_mode=ParseMode.HTML)
+    model = args[1].strip()
+    await set_setting("gemini_model", model)
+    await msg.answer(f"✅ Модель установлена: <code>{model}</code>", parse_mode=ParseMode.HTML)
+
+# ── /keystat (владелец) ──────────────────────────────────────────────────────
+
+@router.message(Command("keystat"))
+async def cmd_keystat(msg: Message):
+    if not is_owner(msg):
+        return
+    stat = key_manager.stat()
+    await msg.answer(f"<b>🔑 Статус ключей:</b>\n{stat}", parse_mode=ParseMode.HTML)
+
+# ── /setprompt (все, только ЛС) ─────────────────────────────────────────────
+
+@router.message(Command("setprompt"))
+async def cmd_setprompt(msg: Message):
+    if not is_pm(msg):
+        return await msg.answer("Эта команда работает только в личных сообщениях.")
+    if not msg.from_user:
+        return
+    args = msg.text.split(maxsplit=1)
+    if len(args) < 2:
+        cur = await get_user_prompt(msg.from_user.id)
+        return await msg.answer(
+            f"Текущий твой промт:\n<pre>{html.escape(cur or '(пусто)')}</pre>\n\n"
+            "Чтобы установить: /setprompt &lt;текст&gt;",
+            parse_mode=ParseMode.HTML,
+        )
+    prompt = args[1].strip()
+    await set_user_prompt(msg.from_user.id, prompt)
+    await msg.answer(f"✅ Личный промт установлен ({len(prompt)} символов).")
+
+# ── /clearprompt ────────────────────────────────────────────────────────────
+
+@router.message(Command("clearprompt"))
+async def cmd_clearprompt(msg: Message):
+    if not is_pm(msg):
+        return
+    if not msg.from_user:
+        return
+    await set_user_prompt(msg.from_user.id, "")
+    await msg.answer("🗑 Личный промт сброшен.")
+
+# ── /clearhistory ───────────────────────────────────────────────────────────
+
+@router.message(Command("clearhistory"))
+async def cmd_clearhistory(msg: Message):
+    if not msg.from_user:
+        return
+    await clear_history(msg.from_user.id, msg.chat.id)
+    await msg.answer("🧹 Твоя история диалога очищена.")
+
+# ── /showhistory ────────────────────────────────────────────────────────────
+
+@router.message(Command("showhistory"))
+async def cmd_showhistory(msg: Message):
+    if not msg.from_user:
+        return
+    hist = await get_history(msg.from_user.id, msg.chat.id)
+    if not hist:
+        return await msg.answer("История пуста.")
+    lines = []
+    for item in hist[-20:]:
+        role_label = "🤖 Бот" if item["role"] == "model" else "👤 Ты"
+        snippet = html.escape(item["content"][:200])
+        lines.append(f"<b>{role_label}:</b> {snippet}")
+    await msg.answer("\n\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ── Основной обработчик сообщений ────────────────────────────────────────────
+
+@router.message(F.text)
+async def handle_text(msg: Message, bot: Bot):
+    if not msg.from_user or msg.from_user.is_bot:
+        return
+
+    chat_type = msg.chat.type
+    text = msg.text or ""
+
+    # В группах — отвечаем только если упомянули бота или ответили на его сообщение
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        me = await bot.get_me()
+        bot_username = me.username or ""
+        is_reply_to_bot = (
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.id == me.id
+        )
+        is_mention = bot_username and (f"@{bot_username}" in text)
+        if not is_reply_to_bot and not is_mention:
+            return
+        # Убираем упоминание из текста
+        text = text.replace(f"@{bot_username}", "").strip()
+
+    if not text:
+        return
+
+    # Регистрируем/обновляем юзера
+    await upsert_user(
+        msg.from_user.id,
+        msg.from_user.username or "",
+        msg.from_user.first_name or "",
+    )
+
+    # Собираем промт
+    global_prompt = await get_setting("global_prompt", "") or ""
+    user_prompt = ""
+    if is_pm(msg):
+        user_prompt = await get_user_prompt(msg.from_user.id) or ""
+
+    # Итоговый системный промт: сначала глобальный, потом личный
+    parts = [p for p in [global_prompt, user_prompt] if p.strip()]
+    system_prompt = "\n\n".join(parts)
+
+    # История
+    history = await get_history(msg.from_user.id, msg.chat.id)
+
+    # Модель
+    model_name = await get_setting("gemini_model", DEFAULT_MODEL) or DEFAULT_MODEL
+
+    # Показываем "печатает..."
+    await bot.send_chat_action(msg.chat.id, "typing")
+
+    # Запрос в Gemini
+    answer = await call_gemini(
+        user_text=text,
+        history=history,
+        system_prompt=system_prompt,
+        model_name=model_name,
+    )
+
+    # Сохраняем историю (только если ответ не ошибка)
+    if not answer.startswith("❌"):
+        await add_history(msg.from_user.id, msg.chat.id, "user", text)
+        await add_history(msg.from_user.id, msg.chat.id, "model", answer)
+
+    await send_reply(msg, answer)
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
+    token = BOT_TOKEN
+    if not token:
+        # Попытка из .env
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            token = os.getenv("BOT_TOKEN", "")
+        except ImportError:
+            pass
+
+    if not token:
+        log.error("BOT_TOKEN не установлен! Установи переменную окружения BOT_TOKEN.")
+        return
+
     await init_db()
     await key_manager.load()
 
     bot = Bot(
-        token=BOT_TOKEN,
+        token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
