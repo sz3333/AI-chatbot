@@ -5,53 +5,27 @@
 ╚══════════════════════════════════════════════════════════════╝
 
 Установка зависимостей:
-    pip install aiogram google-genai aiosqlite python-dotenv
+    pip install -U aiogram google-genai aiosqlite python-dotenv
 
 Запуск:
-    BOT_TOKEN=<токен> python gemini_bot.py
-
-Или создай .env:
-    BOT_TOKEN=ваш_токен_бота
-
-Владелец (OWNER_ID = 93823977) — особые права:
-  /settokens key1,key2,key3   — установить Gemini API ключи
-  /setglobalprompt <текст>    — глобальный промт для всех
-  /statdb                     — статистика пользователей в БД
-  /addusers                   — добавить пользователей из .txt файла
-  /broadcast <текст>          — рассылка всем активным юзерам
-  /clearall                   — очистить всю память бота
-  /setmodel <модель>          — сменить модель Gemini
-  /keystat                    — статистика ключей API
-
-Команды для всех (только в ЛС):
-  /setprompt <текст>          — личный промт (только для себя)
-  /clearprompt                — сбросить личный промт
-  /clearhistory               — очистить свою историю диалога
-  /showhistory                — показать последние 10 сообщений истории
-  /help                       — справка
+    python gemini_bot.py
 """
 
 import asyncio
-import json
+import html
 import logging
 import os
 import random
 import re
+import sys
 import time
-import html
-from datetime import datetime
 from typing import Optional
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    ContentType,
-    FSInputFile,
-    BufferedInputFile,
-)
 from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 
 try:
@@ -61,15 +35,23 @@ try:
 except ImportError:
     GOOGLE_AVAILABLE = False
 
-# ─── Конфигурация ───────────────────────────────────────────────────────────
+# ─── Загрузка конфига ───────────────────────────────────────────────────────
+if not os.path.exists("config.py"):
+    print("❌ Файл config.py не найден! Создай его рядом с ботом.")
+    sys.exit(1)
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")          # обязательно
-OWNER_ID    = 93823977                              # твой TG ID
-DB_PATH     = "gemini_bot.db"
-DEFAULT_MODEL    = "gemini-2.5-flash"
-GEMINI_TIMEOUT   = 120
-MAX_HISTORY_PAIRS = 30                             # пар user/model в памяти
-MAX_TG_LEN       = 4000                            # до этого — текст, больше — файл
+from config import (
+    BOT_TOKEN,
+    OWNER_ID,
+    DEFAULT_MODEL,
+    GEMINI_TIMEOUT,
+    MAX_HISTORY_PAIRS,
+    MAX_TG_LEN,
+    DB_PATH,
+)
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не указан в config.py!")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,7 +145,6 @@ async def add_user_ids_bulk(ids: list[int]) -> tuple[int, int]:
             async with db.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)) as cur:
                 exists = await cur.fetchone()
             if exists:
-                # уже есть — просто помечаем активным
                 await db.execute("UPDATE users SET active=1 WHERE user_id=?", (uid,))
                 skipped += 1
             else:
@@ -219,8 +200,7 @@ async def clear_all_history():
 class KeyManager:
     def __init__(self):
         self._keys: list[str] = []
-        self._idx  = 0
-        self._failures: dict[str, int] = {}   # key -> fail_count
+        self._failures: dict[str, int] = {}
 
     async def load(self):
         raw = await get_setting("gemini_keys", "")
@@ -234,14 +214,6 @@ class KeyManager:
 
     def get_keys(self) -> list[str]:
         return list(self._keys)
-
-    def next_key(self) -> Optional[str]:
-        """Круговое переключение с учётом сбоев."""
-        if not self._keys:
-            return None
-        # Сортируем: меньше сбоев — раньше
-        sorted_keys = sorted(self._keys, key=lambda k: (self._failures.get(k, 0), random.random()))
-        return sorted_keys[0]
 
     def mark_fail(self, key: str):
         self._failures[key] = self._failures.get(key, 0) + 1
@@ -278,7 +250,7 @@ async def call_gemini(
     model_name: str = DEFAULT_MODEL,
 ) -> str:
     if not GOOGLE_AVAILABLE:
-        return "❌ Библиотека google-genai не установлена. Выполните: pip install google-genai"
+        return "❌ Библиотека google-genai не установлена. Выполните: pip install -U google-genai"
 
     keys = key_manager.get_keys()
     if not keys:
@@ -301,9 +273,9 @@ async def call_gemini(
         temperature=1.0,
     )
 
-    # Попытки по всем ключам
     sorted_keys = sorted(keys, key=lambda k: (key_manager._failures.get(k, 0), random.random()))
     last_err = "Неизвестная ошибка"
+
     for key in sorted_keys:
         try:
             client = genai.Client(api_key=key)
@@ -334,20 +306,13 @@ async def call_gemini(
 
 def md_to_simple_html(text: str) -> str:
     """Базовая конвертация markdown → HTML для Telegram."""
-    # Код-блоки
     text = re.sub(r"```(\w+)?\n?([\s\S]+?)```", lambda m: f"<pre><code>{html.escape(m.group(2).strip())}</code></pre>", text)
-    # Инлайн-код
     text = re.sub(r"`([^`]+)`", lambda m: f"<code>{html.escape(m.group(1))}</code>", text)
-    # Жирный
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    # Курсив
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
-    # Зачёркнутый
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    # Заголовки → жирный
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    # Списки → буллет
     text = re.sub(r"^[\s]*[-*+]\s+", "• ", text, flags=re.MULTILINE)
     return text
 
@@ -394,7 +359,7 @@ async def cmd_help(msg: Message):
     if is_owner(msg):
         owner_block = (
             "\n\n<b>🔐 Команды владельца:</b>\n"
-            "/settokens key1,key2 — установить API ключи\n"
+            "/settokens key1,key2,key3 — установить API ключи\n"
             "/setglobalprompt &lt;текст&gt; — глобальный промт\n"
             "/statdb — статистика юзеров\n"
             "/addusers — добавить юзеров из .txt файла\n"
@@ -497,7 +462,6 @@ async def handle_document(msg: Message, bot: Bot):
     if not msg.from_user:
         return
     uid = msg.from_user.id
-    # Обработка файла для /addusers
     if uid in _awaiting_users_file and is_owner(msg):
         _awaiting_users_file.discard(uid)
         if not msg.document.file_name.endswith(".txt"):
@@ -509,7 +473,6 @@ async def handle_document(msg: Message, bot: Bot):
         except Exception as e:
             return await msg.answer(f"❌ Ошибка чтения файла: {e}")
 
-        # Парсим ID
         raw_ids = re.findall(r"\d{5,15}", text)
         user_ids = list({int(i) for i in raw_ids})
 
@@ -526,9 +489,6 @@ async def handle_document(msg: Message, bot: Bot):
             parse_mode=ParseMode.HTML,
         )
         return
-
-    # Если не ждём файл — игнорируем документ в ЛС
-    # (можно добавить обработку других документов)
 
 # ── /broadcast (владелец) ────────────────────────────────────────────────────
 
@@ -549,7 +509,7 @@ async def cmd_broadcast(msg: Message, bot: Bot):
             sent += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.05)  # антиспам
+        await asyncio.sleep(0.05)
     await status.edit_text(
         f"✅ Рассылка завершена.\n"
         f"📨 Отправлено: <b>{sent}</b>\n"
@@ -667,39 +627,31 @@ async def handle_text(msg: Message, bot: Bot):
         is_mention = bot_username and (f"@{bot_username}" in text)
         if not is_reply_to_bot and not is_mention:
             return
-        # Убираем упоминание из текста
         text = text.replace(f"@{bot_username}", "").strip()
 
     if not text:
         return
 
-    # Регистрируем/обновляем юзера
     await upsert_user(
         msg.from_user.id,
         msg.from_user.username or "",
         msg.from_user.first_name or "",
     )
 
-    # Собираем промт
     global_prompt = await get_setting("global_prompt", "") or ""
     user_prompt = ""
     if is_pm(msg):
         user_prompt = await get_user_prompt(msg.from_user.id) or ""
 
-    # Итоговый системный промт: сначала глобальный, потом личный
     parts = [p for p in [global_prompt, user_prompt] if p.strip()]
     system_prompt = "\n\n".join(parts)
 
-    # История
     history = await get_history(msg.from_user.id, msg.chat.id)
 
-    # Модель
     model_name = await get_setting("gemini_model", DEFAULT_MODEL) or DEFAULT_MODEL
 
-    # Показываем "печатает..."
     await bot.send_chat_action(msg.chat.id, "typing")
 
-    # Запрос в Gemini
     answer = await call_gemini(
         user_text=text,
         history=history,
@@ -707,7 +659,6 @@ async def handle_text(msg: Message, bot: Bot):
         model_name=model_name,
     )
 
-    # Сохраняем историю (только если ответ не ошибка)
     if not answer.startswith("❌"):
         await add_history(msg.from_user.id, msg.chat.id, "user", text)
         await add_history(msg.from_user.id, msg.chat.id, "model", answer)
@@ -717,20 +668,6 @@ async def handle_text(msg: Message, bot: Bot):
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
-    token = BOT_TOKEN
-    if not token:
-        # Попытка из .env
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-            token = os.getenv("BOT_TOKEN", "")
-        except ImportError:
-            pass
-
-    if not token:
-        log.error("BOT_TOKEN не установлен! Установи переменную окружения BOT_TOKEN.")
-        return
-
     await init_db()
     await key_manager.load()
 
@@ -741,8 +678,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    log.info("Бот запущен. Владелец ID: %d", OWNER_ID)
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    log.info(f"Бот запущен. Владелец ID: {OWNER_ID}")
+    await dp.start_polling(bot, allowed_updates=["message"])
 
 if __name__ == "__main__":
     asyncio.run(main())
