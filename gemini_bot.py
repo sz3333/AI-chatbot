@@ -543,3 +543,22 @@ async def cmd_setglobalprompt(msg: Message):
             "Чтобы установить: /setglobalprompt &lt;текст&gt;",
             parse_mode=ParseMode.HTML,
         )
+
+# ─── Запуск ──────────────────────────────────────────────────────────────────
+
+async def main():
+    await init_db()
+    await key_manager.load()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("Бот запущен. Владелец ID: %d", OWNER_ID)
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+
+if __name__ == "__main__":
+    asyncio.run(main())
