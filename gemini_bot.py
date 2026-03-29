@@ -735,7 +735,7 @@ async def main():
     await key_manager.load()
 
     bot = Bot(
-        token=token,
+        token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
