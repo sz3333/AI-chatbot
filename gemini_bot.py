@@ -2,6 +2,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║              Gemini AI Bot  —  tag: LidF1x                  ║
 ║  Aiogram 3.x + SQLite + Google Gemini API (multi-key)       ║
+║  + Media support: photo / video / audio / gif / text files  ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Зависимости:
@@ -32,10 +33,12 @@
 """
 
 import asyncio
+import io
 import logging
 import os
 import random
 import re
+import tempfile
 import time
 import html
 from typing import Optional
@@ -72,6 +75,17 @@ SPAM_WINDOW_SEC   = getattr(_cfg, "SPAM_WINDOW_SEC", 10)
 SPAM_MAX_MESSAGES = getattr(_cfg, "SPAM_MAX_MESSAGES", 5)
 SPAM_BAN_AFTER    = getattr(_cfg, "SPAM_BAN_AFTER", 10)
 SPAM_BAN_DURATION = getattr(_cfg, "SPAM_BAN_DURATION", 300)
+
+# Лимит размера файла для ffmpeg (90 МБ)
+MAX_FFMPEG_SIZE = 90 * 1024 * 1024
+
+# MIME-типы, которые читаем как текст и вставляем в промпт
+TEXT_MIME_TYPES = {
+    "text/plain", "text/markdown", "text/html", "text/css", "text/csv",
+    "application/json", "application/xml", "application/x-python",
+    "text/x-python", "application/javascript", "application/x-sh",
+}
+TEXT_EXTENSIONS = {"txt", "py", "js", "json", "md", "html", "css", "sh", "ts", "yaml", "yml", "toml", "ini", "cfg"}
 
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN не задан в config.py!")
@@ -309,6 +323,264 @@ class KeyManager:
 
 key_manager = KeyManager()
 
+# ─── Обработка медиа → gtypes.Part список ────────────────────────────────────
+
+async def build_media_parts(msg: Message, bot: Bot, caption_text: str = "") -> tuple[list, list[str]]:
+    """
+    Скачивает медиа из сообщения и собирает список gtypes.Part.
+    Возвращает (parts, warnings).
+    caption_text — текст подписи/вопроса пользователя.
+    """
+    parts: list = []
+    warnings: list[str] = []
+
+    async def download_bytes(file_id: str) -> bytes:
+        bio = io.BytesIO()
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, bio)
+        return bio.getvalue()
+
+    # ── Фото ──────────────────────────────────────────────────────────────────
+    if msg.photo:
+        try:
+            data = await download_bytes(msg.photo[-1].file_id)
+            parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="image/jpeg", data=data)))
+        except Exception as e:
+            warnings.append(f"⚠️ Ошибка загрузки фото: {e}")
+
+    # ── Стикер ────────────────────────────────────────────────────────────────
+    elif msg.sticker:
+        if msg.sticker.is_animated or msg.sticker.is_video:
+            emoji = msg.sticker.emoji or "?"
+            parts.append(gtypes.Part(text=f"[Стикер: {emoji}]"))
+        else:
+            # Статичный webp стикер — отправляем как картинку
+            try:
+                data = await download_bytes(msg.sticker.file_id)
+                parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="image/webp", data=data)))
+            except Exception as e:
+                warnings.append(f"⚠️ Ошибка загрузки стикера: {e}")
+
+    # ── Анимация / GIF ────────────────────────────────────────────────────────
+    elif msg.animation:
+        input_path = output_path = None
+        try:
+            data = await download_bytes(msg.animation.file_id)
+            if len(data) > MAX_FFMPEG_SIZE:
+                warnings.append("⚠️ GIF слишком большой (> 90 МБ).")
+            else:
+                ext = (msg.animation.file_name or "anim.mp4").rsplit(".", 1)[-1]
+                with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
+                    f.write(data)
+                    input_path = f.name
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    output_path = f.name
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-an", "-movflags", "+faststart", output_path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                with open(output_path, "rb") as f:
+                    parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="video/mp4", data=f.read())))
+        except Exception as e:
+            warnings.append(f"⚠️ Ошибка обработки GIF: {e}")
+        finally:
+            for p in (input_path, output_path):
+                if p and os.path.exists(p):
+                    os.remove(p)
+
+    # ── Видео / VideoNote ─────────────────────────────────────────────────────
+    elif msg.video or msg.video_note:
+        media = msg.video or msg.video_note
+        input_path = output_path = None
+        try:
+            data = await download_bytes(media.file_id)
+            if len(data) > MAX_FFMPEG_SIZE:
+                warnings.append("⚠️ Видео слишком большое (> 90 МБ).")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    f.write(data)
+                    input_path = f.name
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    output_path = f.name
+                # Проверяем наличие аудиодорожки
+                proc_probe = await asyncio.create_subprocess_exec(
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_type",
+                    "-of", "default=noprint_wrappers=1:nokey=1", input_path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await proc_probe.communicate()
+                has_audio = bool(stdout.strip())
+                cmd = ["ffmpeg", "-y", "-i", input_path]
+                maps = ["-map", "0:v:0"]
+                if not has_audio:
+                    cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
+                    maps.extend(["-map", "1:a:0"])
+                else:
+                    maps.extend(["-map", "0:a:0?"])
+                cmd.extend([
+                    *maps,
+                    "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-shortest", output_path
+                ])
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                with open(output_path, "rb") as f:
+                    parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="video/mp4", data=f.read())))
+        except Exception as e:
+            warnings.append(f"⚠️ Ошибка обработки видео: {e}")
+        finally:
+            for p in (input_path, output_path):
+                if p and os.path.exists(p):
+                    os.remove(p)
+
+    # ── Аудио / Голосовое ─────────────────────────────────────────────────────
+    elif msg.audio or msg.voice:
+        media = msg.audio or msg.voice
+        mime = getattr(media, "mime_type", "audio/ogg") or "audio/ogg"
+        ext = mime.split("/")[-1] if "/" in mime else "ogg"
+        input_path = output_path = None
+        try:
+            data = await download_bytes(media.file_id)
+            if len(data) > MAX_FFMPEG_SIZE:
+                warnings.append("⚠️ Аудио слишком большое (> 90 МБ).")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
+                    f.write(data)
+                    input_path = f.name
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    output_path = f.name
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-c:a", "libmp3lame", "-q:a", "2", output_path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                with open(output_path, "rb") as f:
+                    parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="audio/mpeg", data=f.read())))
+        except Exception as e:
+            warnings.append(f"⚠️ Ошибка обработки аудио: {e}")
+        finally:
+            for p in (input_path, output_path):
+                if p and os.path.exists(p):
+                    os.remove(p)
+
+    # ── Документ ──────────────────────────────────────────────────────────────
+    elif msg.document:
+        doc = msg.document
+        mime = doc.mime_type or "application/octet-stream"
+        filename = doc.file_name or "file"
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        if mime.startswith("image/"):
+            try:
+                data = await download_bytes(doc.file_id)
+                parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type=mime, data=data)))
+            except Exception as e:
+                warnings.append(f"⚠️ Ошибка загрузки изображения '{filename}': {e}")
+
+        elif mime in TEXT_MIME_TYPES or ext in TEXT_EXTENSIONS:
+            try:
+                data = await download_bytes(doc.file_id)
+                file_content = data.decode("utf-8", errors="replace")
+                parts.insert(0, gtypes.Part(text=f"[Содержимое файла '{filename}']:\n```\n{file_content}\n```"))
+            except Exception as e:
+                warnings.append(f"⚠️ Ошибка чтения файла '{filename}': {e}")
+
+        elif mime.startswith("audio/"):
+            input_path = output_path = None
+            try:
+                data = await download_bytes(doc.file_id)
+                if len(data) > MAX_FFMPEG_SIZE:
+                    warnings.append(f"⚠️ Аудиофайл '{filename}' слишком большой.")
+                else:
+                    with tempfile.NamedTemporaryFile(suffix=f".{ext or 'mp3'}", delete=False) as f:
+                        f.write(data)
+                        input_path = f.name
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                        output_path = f.name
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", input_path,
+                        "-c:a", "libmp3lame", "-q:a", "2", output_path,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    await proc.communicate()
+                    with open(output_path, "rb") as f:
+                        parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="audio/mpeg", data=f.read())))
+            except Exception as e:
+                warnings.append(f"⚠️ Ошибка обработки аудио '{filename}': {e}")
+            finally:
+                for p in (input_path, output_path):
+                    if p and os.path.exists(p):
+                        os.remove(p)
+
+        elif mime.startswith("video/"):
+            input_path = output_path = None
+            try:
+                data = await download_bytes(doc.file_id)
+                if len(data) > MAX_FFMPEG_SIZE:
+                    warnings.append(f"⚠️ Видеофайл '{filename}' слишком большой.")
+                else:
+                    with tempfile.NamedTemporaryFile(suffix=f".{ext or 'mp4'}", delete=False) as f:
+                        f.write(data)
+                        input_path = f.name
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                        output_path = f.name
+                    proc_probe = await asyncio.create_subprocess_exec(
+                        "ffprobe", "-v", "error", "-select_streams", "a:0",
+                        "-show_entries", "stream=codec_type",
+                        "-of", "default=noprint_wrappers=1:nokey=1", input_path,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await proc_probe.communicate()
+                    has_audio = bool(stdout.strip())
+                    cmd = ["ffmpeg", "-y", "-i", input_path]
+                    maps = ["-map", "0:v:0"]
+                    if not has_audio:
+                        cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
+                        maps.extend(["-map", "1:a:0"])
+                    else:
+                        maps.extend(["-map", "0:a:0?"])
+                    cmd.extend([
+                        *maps,
+                        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                        "-c:v", "libx264", "-c:a", "aac",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        "-shortest", output_path
+                    ])
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    await proc.communicate()
+                    with open(output_path, "rb") as f:
+                        parts.append(gtypes.Part(inline_data=gtypes.Blob(mime_type="video/mp4", data=f.read())))
+            except Exception as e:
+                warnings.append(f"⚠️ Ошибка обработки видео '{filename}': {e}")
+            finally:
+                for p in (input_path, output_path):
+                    if p and os.path.exists(p):
+                        os.remove(p)
+
+        else:
+            warnings.append(f"⚠️ Формат файла не поддерживается: {mime}")
+
+    # Текст/подпись идёт первым в parts
+    if caption_text:
+        parts.insert(0, gtypes.Part(text=caption_text))
+    elif not parts:
+        pass  # нет ни медиа, ни текста — вернём пустой список
+
+    return parts, warnings
+
+
 # ─── Gemini API ───────────────────────────────────────────────────────────────
 
 async def call_gemini(
@@ -317,6 +589,18 @@ async def call_gemini(
     system_prompt: str = "",
     model_name: str = DEFAULT_MODEL,
 ) -> str:
+    """Текстовый запрос к Gemini (без медиа)."""
+    parts = [gtypes.Part(text=user_text)]
+    return await call_gemini_with_parts(parts, history, system_prompt, model_name)
+
+
+async def call_gemini_with_parts(
+    user_parts: list,
+    history: list[dict],
+    system_prompt: str = "",
+    model_name: str = DEFAULT_MODEL,
+) -> str:
+    """Запрос к Gemini с произвольным списком gtypes.Part (текст + медиа)."""
     if not GOOGLE_AVAILABLE:
         return "❌ google-genai не установлен. Выполни: pip install google-genai"
 
@@ -328,7 +612,7 @@ async def call_gemini(
     for item in history:
         role = "model" if item["role"] == "model" else "user"
         contents.append(gtypes.Content(role=role, parts=[gtypes.Part(text=item["content"])]))
-    contents.append(gtypes.Content(role="user", parts=[gtypes.Part(text=user_text)]))
+    contents.append(gtypes.Content(role="user", parts=user_parts))
 
     safety = [
         gtypes.SafetySetting(category=c, threshold="BLOCK_NONE")
@@ -375,6 +659,7 @@ async def call_gemini(
 
     return f"❌ Все ключи исчерпаны. Последняя ошибка: <code>{html.escape(last_err)}</code>"
 
+
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
 def md_to_html(text: str) -> str:
@@ -409,6 +694,32 @@ def is_pm(message: Message) -> bool:
 def is_owner(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id == OWNER_ID)
 
+
+async def _antispam_check(msg: Message) -> bool:
+    """Возвращает True если можно продолжать обработку, False — если нет."""
+    uid = msg.from_user.id
+    if uid == OWNER_ID:
+        return True
+    status, ban_left = rate_limiter.check(uid)
+    if status == "banned":
+        return False
+    elif status == "ban":
+        await msg.answer(
+            f"🚫 Слишком быстро. Бан на <b>{ban_left}</b> секунд.",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+    elif status == "warn":
+        await msg.answer(
+            f"⚠️ Не спамь! Ещё {SPAM_BAN_AFTER - SPAM_MAX_MESSAGES} "
+            "быстрых сообщений — получишь бан."
+        )
+        return False
+    elif status == "spam":
+        return False
+    return True
+
+
 # ─── Роутер ──────────────────────────────────────────────────────────────────
 
 router = Router()
@@ -422,8 +733,9 @@ async def cmd_start(msg: Message):
         await upsert_user(msg.from_user.id, msg.from_user.username or "", msg.from_user.first_name or "")
     await msg.answer(
         "👋 Привет! Я AI-бот на базе Google Gemini.\n\n"
-        "В личке просто пиши — отвечу.\n"
+        "В личке просто пиши или отправь медиа — отвечу.\n"
         "В группах — ответь на моё сообщение или упомяни меня.\n\n"
+        "Поддерживаю: фото, видео, аудио, голосовые, GIF, текстовые файлы.\n\n"
         "/help — список команд"
     )
 
@@ -528,33 +840,6 @@ async def cmd_addusers(msg: Message):
         "📎 Пришли .txt файл со списком ID.\n\n"
         "<b>Формат</b> — каждый ID на новой строке:\n"
         "<pre>123456789\n987654321</pre>",
-        parse_mode=ParseMode.HTML,
-    )
-
-@router.message(F.document, F.chat.type == ChatType.PRIVATE)
-async def handle_document(msg: Message, bot: Bot):
-    if not msg.from_user:
-        return
-    uid = msg.from_user.id
-    if uid not in _awaiting_users_file or not is_owner(msg):
-        return
-    _awaiting_users_file.discard(uid)
-    if not msg.document.file_name.endswith(".txt"):
-        return await msg.answer("❌ Нужен .txt файл.")
-    try:
-        file = await bot.get_file(msg.document.file_id)
-        content_bytes = await bot.download_file(file.file_path)
-        text = content_bytes.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        return await msg.answer(f"❌ Ошибка чтения: {e}")
-    raw_ids = re.findall(r"\d{5,15}", text)
-    user_ids = list({int(i) for i in raw_ids})
-    if not user_ids:
-        return await msg.answer("❌ Не найдено ни одного ID.")
-    status_msg = await msg.answer(f"⏳ Обрабатываю {len(user_ids)} ID...")
-    added, skipped = await add_user_ids_bulk(user_ids)
-    await status_msg.edit_text(
-        f"✅ Готово!\n➕ Добавлено: <b>{added}</b>\n🔄 Уже были: <b>{skipped}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -710,7 +995,111 @@ async def cmd_showhistory(msg: Message):
         lines.append(f"{label} {snippet}")
     await msg.answer("\n\n".join(lines), parse_mode=ParseMode.HTML)
 
-# ── Основной обработчик ───────────────────────────────────────────────────────
+# ── Документ — /addusers для владельца, иначе → Gemini ───────────────────────
+
+@router.message(F.document)
+async def handle_document(msg: Message, bot: Bot):
+    if not msg.from_user:
+        return
+    uid = msg.from_user.id
+
+    # Режим /addusers
+    if uid in _awaiting_users_file and is_owner(msg):
+        _awaiting_users_file.discard(uid)
+        if not msg.document.file_name.endswith(".txt"):
+            return await msg.answer("❌ Нужен .txt файл.")
+        try:
+            file = await bot.get_file(msg.document.file_id)
+            content_bytes = await bot.download_file(file.file_path)
+            text = content_bytes.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            return await msg.answer(f"❌ Ошибка чтения: {e}")
+        raw_ids = re.findall(r"\d{5,15}", text)
+        user_ids = list({int(i) for i in raw_ids})
+        if not user_ids:
+            return await msg.answer("❌ Не найдено ни одного ID.")
+        status_msg = await msg.answer(f"⏳ Обрабатываю {len(user_ids)} ID...")
+        added, skipped = await add_user_ids_bulk(user_ids)
+        await status_msg.edit_text(
+            f"✅ Готово!\n➕ Добавлено: <b>{added}</b>\n🔄 Уже были: <b>{skipped}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Иначе — отправляем документ в Gemini
+    await _handle_media_message(msg, bot)
+
+# ── Медиа-хэндлер (фото / видео / аудио / голос / анимация / стикер) ─────────
+
+@router.message(F.photo | F.video | F.audio | F.voice | F.animation | F.video_note | F.sticker)
+async def handle_media(msg: Message, bot: Bot):
+    await _handle_media_message(msg, bot)
+
+# ── Общая логика обработки медиа-сообщений ───────────────────────────────────
+
+async def _handle_media_message(msg: Message, bot: Bot):
+    if not msg.from_user or msg.from_user.is_bot:
+        return
+
+    chat_type = msg.chat.type
+
+    # В группах — только если упомянули или ответили боту
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        me = await bot.get_me()
+        bot_username = me.username or ""
+        caption = msg.caption or ""
+        is_reply_to_bot = (
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.id == me.id
+        )
+        is_mention = bool(bot_username and f"@{bot_username}" in caption)
+        if not is_reply_to_bot and not is_mention:
+            return
+
+    uid = msg.from_user.id
+
+    if not await _antispam_check(msg):
+        return
+
+    await upsert_user(uid, msg.from_user.username or "", msg.from_user.first_name or "")
+
+    caption_text = (msg.caption or "").strip()
+    # Убираем упоминание бота из подписи в группах
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        me = await bot.get_me()
+        caption_text = caption_text.replace(f"@{me.username}", "").strip()
+
+    await bot.send_chat_action(msg.chat.id, "typing")
+
+    parts, warnings = await build_media_parts(msg, bot, caption_text)
+
+    if not parts:
+        warn_text = "\n".join(warnings) if warnings else "⚠️ Не удалось обработать медиафайл."
+        return await msg.reply(warn_text)
+
+    global_prompt = await get_setting("global_prompt", "") or ""
+    user_prompt = (await get_user_prompt(uid) or "") if is_pm(msg) else ""
+    system_parts = [p for p in [global_prompt, user_prompt] if p.strip()]
+    system_prompt = "\n\n".join(system_parts)
+
+    history = await get_history(uid, msg.chat.id)
+    model_name = await get_setting("gemini_model", DEFAULT_MODEL) or DEFAULT_MODEL
+
+    answer = await call_gemini_with_parts(parts, history, system_prompt, model_name)
+
+    # Сохраняем в историю текстовое резюме запроса
+    if not answer.startswith("❌"):
+        history_text = caption_text or "[медиафайл]"
+        await add_history(uid, msg.chat.id, "user", history_text)
+        await add_history(uid, msg.chat.id, "model", answer)
+
+    if warnings:
+        answer = "\n".join(warnings) + "\n\n" + answer
+
+    await send_reply(msg, answer)
+
+# ── Основной текстовый обработчик ─────────────────────────────────────────────
 
 @router.message(F.text)
 async def handle_text(msg: Message, bot: Bot):
@@ -739,45 +1128,21 @@ async def handle_text(msg: Message, bot: Bot):
 
     uid = msg.from_user.id
 
-    # Антиспам (владельца не трогаем)
-    if uid != OWNER_ID:
-        status, ban_left = rate_limiter.check(uid)
-        if status == "banned":
-            return
-        elif status == "ban":
-            await msg.answer(
-                f"🚫 Слишком быстро. Бан на <b>{ban_left}</b> секунд.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        elif status == "warn":
-            await msg.answer(
-                f"⚠️ Не спамь! Ещё {SPAM_BAN_AFTER - SPAM_MAX_MESSAGES} "
-                "быстрых сообщений — получишь бан."
-            )
-            return
-        elif status == "spam":
-            return
+    if not await _antispam_check(msg):
+        return
 
-    # Регистрируем юзера
     await upsert_user(uid, msg.from_user.username or "", msg.from_user.first_name or "")
 
-    # Промты
     global_prompt = await get_setting("global_prompt", "") or ""
     user_prompt = (await get_user_prompt(uid) or "") if is_pm(msg) else ""
     parts = [p for p in [global_prompt, user_prompt] if p.strip()]
     system_prompt = "\n\n".join(parts)
 
-    # История
     history = await get_history(uid, msg.chat.id)
-
-    # Модель
     model_name = await get_setting("gemini_model", DEFAULT_MODEL) or DEFAULT_MODEL
 
-    # Печатает...
     await bot.send_chat_action(msg.chat.id, "typing")
 
-    # Запрос к Gemini
     answer = await call_gemini(
         user_text=text,
         history=history,
@@ -785,7 +1150,6 @@ async def handle_text(msg: Message, bot: Bot):
         model_name=model_name,
     )
 
-    # Сохраняем историю
     if not answer.startswith("❌"):
         await add_history(uid, msg.chat.id, "user", text)
         await add_history(uid, msg.chat.id, "model", answer)
