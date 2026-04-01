@@ -664,10 +664,11 @@ async def call_gemini_image(
     prompt: str,
     history: list[dict],
     system_prompt: str = "",
-    model_name: str = "gemini-2.5-flash-image",
     aspect_ratio: str = "1:1",
 ) -> Optional[bytes]:
-    """Генерация картинки через Gemini 2.5 Flash Image (Nano Banana, free tier ~500/день)."""
+    """Генерация картинки — модель берётся из /setmodel image"""
+    model_name = await get_setting("gemini_image_model", "gemini-2.5-flash-image")
+
     if not GOOGLE_AVAILABLE:
         return None
 
@@ -954,22 +955,32 @@ async def cmd_clearall(msg: Message):
 async def cmd_setmodel(msg: Message):
     if not is_owner(msg):
         return
-    args = msg.text.split(maxsplit=1)
+    args = msg.text.split(maxsplit=2)
+
     if len(args) < 2:
-        cur = await get_setting("gemini_model", DEFAULT_MODEL)
+        text_model = await get_setting("gemini_model", DEFAULT_MODEL)
+        img_model = await get_setting("gemini_image_model", "gemini-2.5-flash-image")
         return await msg.answer(
-            f"Текущая модель: <code>{cur}</code>\n"
-            "Использование: /setmodel &lt;модель&gt;\n\n"
-            "Рекомендуемые:\n"
-            "• <code>gemini-2.5-flash-lite</code> — быстрый и дешёвый\n"
-            "• <code>gemini-2.5-flash</code> — баланс качества и скорости\n"
-            "• <code>gemini-2.5-pro</code> — максимум качества\n"
-            "• <code>gemini-2.5-flash-image</code> — Nano Banana (картинки)",
+            f"Текущие модели:\n"
+            f"📝 Текст: <code>{text_model}</code>\n"
+            f"🖼 Картинки: <code>{img_model}</code>\n\n"
+            "Использование:\n"
+            "/setmodel &lt;модель&gt; — для текста\n"
+            "/setmodel image &lt;модель&gt; — для картинок\n\n"
+            "Пример: /setmodel image gemini-2.5-flash-image",
             parse_mode=ParseMode.HTML,
         )
-    model = args[1].strip()
-    await set_setting("gemini_model", model)
-    await msg.answer(f"✅ Модель: <code>{model}</code>", parse_mode=ParseMode.HTML)
+
+    if args[1].lower() == "image":
+        if len(args) < 3:
+            return await msg.answer("❌ /setmodel image &lt;модель&gt;", parse_mode=ParseMode.HTML)
+        model = args[2].strip()
+        await set_setting("gemini_image_model", model)
+        await msg.answer(f"✅ Модель для картинок: <code>{model}</code>", parse_mode=ParseMode.HTML)
+    else:
+        model = args[1].strip()
+        await set_setting("gemini_model", model)
+        await msg.answer(f"✅ Модель для текста: <code>{model}</code>", parse_mode=ParseMode.HTML)
 
 # ── /keystat ─────────────────────────────────────────────────────────────────
 
