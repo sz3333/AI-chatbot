@@ -660,6 +660,76 @@ async def call_gemini_with_parts(
     return f"❌ Все ключи исчерпаны. Последняя ошибка: <code>{html.escape(last_err)}</code>"
 
 
+async def call_gemini_image(
+    prompt: str,
+    history: list[dict],
+    system_prompt: str = "",
+    model_name: str = "gemini-2.0-flash-preview-image-generation",
+    aspect_ratio: str = "1:1",
+) -> Optional[bytes]:
+    """Генерация картинки через Gemini Image Generation."""
+    if not GOOGLE_AVAILABLE:
+        return None
+
+    keys = key_manager.get_keys()
+    if not keys:
+        return None
+
+    contents = []
+    for item in history[-4:]:
+        role = "model" if item["role"] == "model" else "user"
+        contents.append(gtypes.Content(role=role, parts=[gtypes.Part(text=item["content"])]))
+    contents.append(gtypes.Content(role="user", parts=[gtypes.Part(text=prompt)]))
+
+    safety = [
+        gtypes.SafetySetting(category=c, threshold="BLOCK_NONE")
+        for c in [
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        ]
+    ]
+
+    cfg = gtypes.GenerateContentConfig(
+        system_instruction=system_prompt.strip() or None,
+        safety_settings=safety,
+        response_modalities=["IMAGE", "TEXT"],
+        temperature=1.0,
+    )
+
+    sorted_keys = sorted(keys, key=lambda k: (key_manager._failures.get(k, 0), random.random()))
+    last_err = "Неизвестная ошибка"
+
+    for key in sorted_keys:
+        try:
+            client = genai.Client(api_key=key)
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=cfg,
+                ),
+                timeout=GEMINI_TIMEOUT,
+            )
+            for part in response.parts:
+                if part.inline_data and part.inline_data.data:
+                    key_manager.mark_ok(key)
+                    return part.inline_data.data
+            key_manager.mark_fail(key)
+            last_err = "Пустой ответ (нет inline_data)"
+        except asyncio.TimeoutError:
+            last_err = f"Таймаут ({GEMINI_TIMEOUT}с)"
+            key_manager.mark_fail(key)
+        except Exception as e:
+            last_err = str(e)
+            key_manager.mark_fail(key)
+            log.warning(f"Image gen ключ ...{key[-6:]} ошибка: {e}")
+
+    log.error(f"Не удалось сгенерировать картинку: {last_err}")
+    return None
+
+
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
 def md_to_html(text: str) -> str:
@@ -1142,6 +1212,30 @@ async def handle_text(msg: Message, bot: Bot):
     model_name = await get_setting("gemini_model", DEFAULT_MODEL) or DEFAULT_MODEL
 
     await bot.send_chat_action(msg.chat.id, "typing")
+
+    # Определяем, хочет ли юзер картинку
+    image_keywords = [
+        "нарисуй", "нарисуй мне", "сгенерируй картинку", "сгенерируй изображение",
+        "generate image", "draw", "make an image", "image of", "picture of",
+        "создай картинку", "создай изображение",
+    ]
+    is_image_request = any(kw.lower() in text.lower() for kw in image_keywords)
+
+    if is_image_request:
+        await bot.send_chat_action(msg.chat.id, "upload_photo")
+        image_data = await call_gemini_image(
+            prompt=text,
+            history=history,
+            system_prompt=system_prompt,
+        )
+        if image_data:
+            await add_history(uid, msg.chat.id, "user", text)
+            await add_history(uid, msg.chat.id, "model", "[сгенерированная картинка]")
+            photo = BufferedInputFile(image_data, filename="gemini_image.png")
+            await msg.reply_photo(photo)
+        else:
+            await msg.reply("❌ Не удалось сгенерировать картинку (лимиты или ошибка ключей)")
+        return
 
     answer = await call_gemini(
         user_text=text,
