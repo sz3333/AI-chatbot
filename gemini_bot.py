@@ -668,6 +668,7 @@ async def call_gemini_image(
 ) -> Optional[bytes]:
     """Генерация картинки — модель берётся из /setmodel image"""
     model_name = await get_setting("gemini_image_model", "gemini-2.5-flash-image")
+    log.info(f"🖼 РЕАЛЬНАЯ МОДЕЛЬ ДЛЯ КАРТИНОК: {model_name}")
 
     if not GOOGLE_AVAILABLE:
         return None
@@ -1246,7 +1247,13 @@ async def handle_text(msg: Message, bot: Bot):
             photo = BufferedInputFile(image_data, filename="gemini_image.png")
             await msg.reply_photo(photo)
         else:
-            await msg.reply("❌ Не удалось сгенерировать картинку. Возможные причины: лимит 500 изображений/день исчерпан, ошибка ключей или запрос заблокирован фильтрами.")
+            await msg.reply(
+                "❌ Не удалось сгенерировать картинку.\n"
+                "Возможные причины:\n"
+                "• Лимит ~500 картинок в сутки исчерпан\n"
+                "• Ключи заблокированы Google\n"
+                "• Модель всё ещё preview (проверь /setmodel)"
+            )
         return
 
     answer = await call_gemini(
@@ -1266,6 +1273,9 @@ async def handle_text(msg: Message, bot: Bot):
 
 async def main():
     await init_db()
+    # Временный сброс модели картинок
+    await set_setting("gemini_image_model", "gemini-2.5-flash-image")
+    log.info("🔄 Принудительно установлена модель gemini-2.5-flash-image")
     await key_manager.load()
 
     bot = Bot(
