@@ -67,7 +67,7 @@ except ModuleNotFoundError:
 BOT_TOKEN         = getattr(_cfg, "BOT_TOKEN", "")
 OWNER_ID          = getattr(_cfg, "OWNER_ID", 0)
 DB_PATH           = getattr(_cfg, "DB_PATH", "gemini_bot.db")
-DEFAULT_MODEL     = getattr(_cfg, "DEFAULT_MODEL", "gemini-2.0-flash-lite")
+DEFAULT_MODEL     = getattr(_cfg, "DEFAULT_MODEL", "gemini-2.5-flash-lite")
 GEMINI_TIMEOUT    = getattr(_cfg, "GEMINI_TIMEOUT", 120)
 MAX_HISTORY_PAIRS = getattr(_cfg, "MAX_HISTORY_PAIRS", 15)
 MAX_TG_LEN        = getattr(_cfg, "MAX_TG_LEN", 4000)
@@ -664,10 +664,10 @@ async def call_gemini_image(
     prompt: str,
     history: list[dict],
     system_prompt: str = "",
-    model_name: str = "gemini-2.0-flash-preview-image-generation",
+    model_name: str = "gemini-2.5-flash-image",
     aspect_ratio: str = "1:1",
 ) -> Optional[bytes]:
-    """Генерация картинки через Gemini Image Generation."""
+    """Генерация картинки через Gemini 2.5 Flash Image (Nano Banana, free tier ~500/день)."""
     if not GOOGLE_AVAILABLE:
         return None
 
@@ -694,7 +694,8 @@ async def call_gemini_image(
     cfg = gtypes.GenerateContentConfig(
         system_instruction=system_prompt.strip() or None,
         safety_settings=safety,
-        response_modalities=["IMAGE", "TEXT"],
+        response_modalities=["IMAGE"],
+        image_config=gtypes.ImageConfig(aspect_ratio=aspect_ratio),
         temperature=1.0,
     )
 
@@ -960,10 +961,10 @@ async def cmd_setmodel(msg: Message):
             f"Текущая модель: <code>{cur}</code>\n"
             "Использование: /setmodel &lt;модель&gt;\n\n"
             "Рекомендуемые:\n"
-            "• <code>gemini-2.0-flash-lite</code> — минимум токенов\n"
-            "• <code>gemini-2.0-flash</code> — баланс\n"
-            "• <code>gemini-2.5-flash</code> — умнее\n"
-            "• <code>gemini-2.5-pro</code> — максимум",
+            "• <code>gemini-2.5-flash-lite</code> — быстрый и дешёвый\n"
+            "• <code>gemini-2.5-flash</code> — баланс качества и скорости\n"
+            "• <code>gemini-2.5-pro</code> — максимум качества\n"
+            "• <code>gemini-2.5-flash-image</code> — Nano Banana (картинки)",
             parse_mode=ParseMode.HTML,
         )
     model = args[1].strip()
@@ -1216,8 +1217,8 @@ async def handle_text(msg: Message, bot: Bot):
     # Определяем, хочет ли юзер картинку
     image_keywords = [
         "нарисуй", "нарисуй мне", "сгенерируй картинку", "сгенерируй изображение",
+        "покажи картинку", "изобрази", "нагенери", "создай картинку", "создай изображение",
         "generate image", "draw", "make an image", "image of", "picture of",
-        "создай картинку", "создай изображение",
     ]
     is_image_request = any(kw.lower() in text.lower() for kw in image_keywords)
 
@@ -1234,7 +1235,7 @@ async def handle_text(msg: Message, bot: Bot):
             photo = BufferedInputFile(image_data, filename="gemini_image.png")
             await msg.reply_photo(photo)
         else:
-            await msg.reply("❌ Не удалось сгенерировать картинку (лимиты или ошибка ключей)")
+            await msg.reply("❌ Не удалось сгенерировать картинку. Возможные причины: лимит 500 изображений/день исчерпан, ошибка ключей или запрос заблокирован фильтрами.")
         return
 
     answer = await call_gemini(
